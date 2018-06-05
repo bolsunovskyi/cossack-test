@@ -1,3 +1,4 @@
 .idea
 logger/logger
 producer/producer
+logger/numbers.log

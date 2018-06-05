@@ -63,11 +63,9 @@ func (p *Producer) sendNum(num uint64) error {
 		buf[i] = byte((num & (mask << uint64(i*8))) >> uint64(i*8))
 	}
 
-	n, err := p.conn.Write(buf)
-	if err != nil {
+	if _, err := p.conn.Write(buf); err != nil {
 		return err
 	}
-	log.Println(n)
 
 	return nil
 }
