@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -12,36 +13,55 @@ import (
 type Logger struct {
 	host                          string
 	port                          int
-	file                          *os.File
+	logWriter                     ReadWriteSyncer
 	buffer                        []uint64
 	bufferSize, bufferPosition    int
 	bufferCopies, maxBufferCopies int
 	speed                         int
+	clients                       []net.Conn
+	listener                      net.Listener
 }
 
-func MakeLogger(host, filePath string, port, bufferSize, bufferMaxCopies, flowSpeed int) (*Logger, error) {
+type ReadWriteSyncer interface {
+	io.WriteCloser
+	Sync() error
+}
+
+func MakeLogger(host, filePath string, port, bufferSize, bufferMaxCopies, flowSpeed int,
+	encryptLog bool, encKey string) (*Logger, error) {
 	if bufferSize < 8 {
 		return nil, errors.New("buffer can't be less than 8 bytes")
 	}
 
-	fp, err := os.OpenFile(filePath, os.O_CREATE, 0755)
+	fp, err := os.Create(filePath)
 	if err != nil {
 		return nil, err
 	}
 
 	realBufferSize := bufferSize / 8
 
-	return &Logger{
+	logger := Logger{
 		port:            port,
 		host:            host,
-		file:            fp,
+		logWriter:       fp,
 		bufferSize:      realBufferSize,
 		buffer:          make([]uint64, realBufferSize),
 		bufferPosition:  0,
 		bufferCopies:    0,
 		maxBufferCopies: bufferMaxCopies,
 		speed:           flowSpeed,
-	}, nil
+	}
+
+	if encryptLog {
+		cph, err := MakeCipher(encKey, fp)
+		if err != nil {
+			return nil, err
+		}
+
+		logger.logWriter = cph
+	}
+
+	return &logger, nil
 }
 
 func buf2uint64(buf []byte, n int) (res uint64) {
@@ -52,7 +72,38 @@ func buf2uint64(buf []byte, n int) (res uint64) {
 	return
 }
 
+func (l *Logger) Stop() error {
+	for k := range l.clients {
+		if err := l.clients[k].Close(); err != nil {
+			log.Println(err)
+		}
+	}
+
+	if err := l.logWriter.Sync(); err != nil {
+		log.Println(err)
+	}
+
+	if err := l.logWriter.Close(); err != nil {
+		log.Println(err)
+	}
+
+	return l.listener.Close()
+}
+
 func (l *Logger) handleSocket(sock net.Conn) {
+	defer func() {
+		//sync file on client exit
+		if err := l.flushBuffer(); err != nil {
+			log.Println(err)
+		}
+
+		for i := range l.clients {
+			if l.clients[i] == sock {
+				l.clients = append(l.clients[:i], l.clients[i+1:]...)
+			}
+		}
+	}()
+
 	buf := make([]byte, 8)
 	throttle := time.Tick(time.Second)
 
@@ -62,7 +113,6 @@ func (l *Logger) handleSocket(sock net.Conn) {
 		for i := 0; i < l.speed; i++ {
 			n, err := sock.Read(buf)
 			if err != nil {
-				log.Println(err)
 				return
 			}
 
@@ -96,11 +146,16 @@ func (l *Logger) flushBuffer() error {
 		return errors.New("peak memory threshold")
 	}
 
-	bufferCopy := l.buffer
+	bufferCopy := l.buffer[0:l.bufferPosition]
 
 	go func(buff []uint64) {
 		for _, n := range bufferCopy {
-			l.file.WriteString(fmt.Sprintf("%d\n", n))
+			if _, err := l.logWriter.Write([]byte(fmt.Sprintf("%d\n", n))); err != nil {
+				log.Println(err)
+			}
+		}
+		if err := l.logWriter.Sync(); err != nil {
+			log.Println(err)
 		}
 
 		l.bufferCopies--
@@ -109,18 +164,24 @@ func (l *Logger) flushBuffer() error {
 	return nil
 }
 
-func (l *Logger) Listen() error {
-	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", l.host, l.port))
+func (l *Logger) Listen() (err error) {
+	l.listener, err = net.Listen("tcp", fmt.Sprintf("%s:%d", l.host, l.port))
 	if err != nil {
-		return err
+		return
 	}
 
+	go func() {
+		time.Sleep(time.Second * 10)
+		l.listener.Close()
+	}()
+
 	for {
-		sock, err := listener.Accept()
+		sock, err := l.listener.Accept()
 		if err != nil {
-			log.Println(err)
-			continue
+			return err
 		}
+		l.clients = append(l.clients, sock)
 		go l.handleSocket(sock)
+
 	}
 }

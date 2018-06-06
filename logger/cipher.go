@@ -1,41 +1,45 @@
 package main
 
 import (
-	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"io"
+	"os"
 )
 
 type Cipher struct {
-	stream cipher.Stream
+	writer     cipher.StreamWriter
+	reader     cipher.StreamReader
+	targetFile ReadWriteSyncer
 }
 
-func (c *Cipher) pad(src []byte) []byte {
-	padding := aes.BlockSize - len(src)%aes.BlockSize
-	paddedText := bytes.Repeat([]byte{byte(padding)}, padding)
-	return append(src, paddedText...)
+func (c *Cipher) Encrypt(message string) (n int, err error) {
+	return c.writer.Write([]byte(message))
 }
 
-func (c *Cipher) Encrypt(message string) ([]byte, error) {
-	plainBytes := c.pad([]byte(message))
-	cipherText := make([]byte, aes.BlockSize+len(plainBytes))
-	iv := cipherText[:aes.BlockSize]
-	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
-		return nil, err
+func (c *Cipher) Write(p []byte) (n int, err error) {
+	return c.writer.Write(p)
+}
+
+func (c *Cipher) Decrypt(out io.ReadWriter) (n int64, err error) {
+	return io.Copy(out, c.reader)
+}
+
+func (c *Cipher) Sync() error {
+	return c.targetFile.Sync()
+}
+
+func (c *Cipher) Close() error {
+	return c.targetFile.Close()
+}
+
+func MakeCipher(key string, targetReaderWriter *os.File) (*Cipher, error) {
+	if key == "" {
+		return nil, errors.New("key is empty")
 	}
 
-	c.stream.XORKeyStream(cipherText[aes.BlockSize:], plainBytes)
-	return cipherText, nil
-}
-
-func (c *Cipher) Decrypt(cipherText []byte) (string, error) {
-	return "", nil
-}
-
-func MakeCipher(key string) (*Cipher, error) {
 	cph := Cipher{}
 
 	hash := sha256.New()
@@ -47,12 +51,15 @@ func MakeCipher(key string) (*Cipher, error) {
 		return nil, err
 	}
 
-	iv := make([]byte, aes.BlockSize)
-	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
-		return nil, err
-	}
+	iv := keyHash[:aes.BlockSize]
 
-	cph.stream = cipher.NewCFBEncrypter(block, iv)
+	enc := cipher.NewCFBEncrypter(block, iv)
+	dec := cipher.NewCFBDecrypter(block, iv)
+
+	cph.writer = cipher.StreamWriter{S: enc, W: targetReaderWriter}
+	cph.reader = cipher.StreamReader{S: dec, R: targetReaderWriter}
+
+	cph.targetFile = targetReaderWriter
 
 	return &cph, nil
 }
